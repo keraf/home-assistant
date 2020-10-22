@@ -1,24 +1,41 @@
 """Provide configuration end points for Groups."""
-import asyncio
+from homeassistant.components.group import (
+    DOMAIN,
+    GROUP_SCHEMA,
+    GroupIntegrationRegistry,
+)
+from homeassistant.config import GROUP_CONFIG_PATH
 from homeassistant.const import SERVICE_RELOAD
-from homeassistant.components.config import EditKeyBasedConfigView
-from homeassistant.components.group import DOMAIN, GROUP_SCHEMA
+from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.typing import HomeAssistantType
+
+from . import EditKeyBasedConfigView
 
 
-CONFIG_PATH = 'groups.yaml'
-
-
-@asyncio.coroutine
-def async_setup(hass):
+async def async_setup(hass):
     """Set up the Group config API."""
-    @asyncio.coroutine
-    def hook(hass):
-        """post_write_hook for Config View that reloads groups."""
-        yield from hass.services.async_call(DOMAIN, SERVICE_RELOAD)
 
-    hass.http.register_view(EditKeyBasedConfigView(
-        'group', 'config', CONFIG_PATH, cv.slug, GROUP_SCHEMA,
-        post_write_hook=hook
-    ))
+    async def hook(action, config_key):
+        """post_write_hook for Config View that reloads groups."""
+        await hass.services.async_call(DOMAIN, SERVICE_RELOAD)
+
+    hass.http.register_view(
+        EditKeyBasedConfigView(
+            "group",
+            "config",
+            GROUP_CONFIG_PATH,
+            cv.slug,
+            GROUP_SCHEMA,
+            post_write_hook=hook,
+        )
+    )
     return True
+
+
+@callback
+def async_describe_on_off_states(
+    hass: HomeAssistantType, registry: GroupIntegrationRegistry
+) -> None:
+    """Describe group on off states."""
+    return

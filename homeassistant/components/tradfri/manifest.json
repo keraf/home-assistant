@@ -1,0 +1,17 @@
+{
+  "domain": "tradfri",
+  "name": "IKEA TRÅDFRI",
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/tradfri",
+  "requirements": [
+    "pytradfri[async]==7.0.2"
+  ],
+  "homekit": {
+    "models": [
+      "TRADFRI"
+    ]
+  },
+  "codeowners": [
+    "@ggravlingen"
+  ]
+}

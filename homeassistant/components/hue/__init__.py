@@ -1,139 +1,176 @@
-"""
-This component provides basic support for the Philips Hue system.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/hue/
-"""
-import ipaddress
+"""Support for the Philips Hue system."""
+import asyncio
 import logging
 
-import voluptuous as vol
+from aiohue.util import normalize_bridge_id
 
-from homeassistant.const import CONF_FILENAME, CONF_HOST
-from homeassistant.helpers import aiohttp_client, config_validation as cv
+from homeassistant import config_entries, core
+from homeassistant.components import persistent_notification
+from homeassistant.helpers import device_registry as dr
 
-from .const import DOMAIN, API_NUPNP
-from .bridge import HueBridge
-# Loading the config flow file will register the flow
-from .config_flow import configured_hosts
-
-REQUIREMENTS = ['aiohue==1.5.0']
+from .bridge import (
+    ATTR_GROUP_NAME,
+    ATTR_SCENE_NAME,
+    SCENE_SCHEMA,
+    SERVICE_HUE_SCENE,
+    HueBridge,
+)
+from .const import (
+    CONF_ALLOW_HUE_GROUPS,
+    CONF_ALLOW_UNREACHABLE,
+    DEFAULT_ALLOW_HUE_GROUPS,
+    DEFAULT_ALLOW_UNREACHABLE,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_BRIDGES = "bridges"
-
-CONF_ALLOW_UNREACHABLE = 'allow_unreachable'
-DEFAULT_ALLOW_UNREACHABLE = False
-
-PHUE_CONFIG_FILE = 'phue.conf'
-
-CONF_ALLOW_HUE_GROUPS = "allow_hue_groups"
-DEFAULT_ALLOW_HUE_GROUPS = True
-
-BRIDGE_CONFIG_SCHEMA = vol.Schema({
-    # Validate as IP address and then convert back to a string.
-    vol.Required(CONF_HOST): vol.All(ipaddress.ip_address, cv.string),
-    # This is for legacy reasons and is only used for importing auth.
-    vol.Optional(CONF_FILENAME, default=PHUE_CONFIG_FILE): cv.string,
-    vol.Optional(CONF_ALLOW_UNREACHABLE,
-                 default=DEFAULT_ALLOW_UNREACHABLE): cv.boolean,
-    vol.Optional(CONF_ALLOW_HUE_GROUPS,
-                 default=DEFAULT_ALLOW_HUE_GROUPS): cv.boolean,
-})
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Optional(CONF_BRIDGES):
-            vol.All(cv.ensure_list, [BRIDGE_CONFIG_SCHEMA]),
-    }),
-}, extra=vol.ALLOW_EXTRA)
 
 
 async def async_setup(hass, config):
     """Set up the Hue platform."""
-    conf = config.get(DOMAIN)
-    if conf is None:
-        conf = {}
+
+    async def hue_activate_scene(call, skip_reload=True):
+        """Handle activation of Hue scene."""
+        # Get parameters
+        group_name = call.data[ATTR_GROUP_NAME]
+        scene_name = call.data[ATTR_SCENE_NAME]
+
+        # Call the set scene function on each bridge
+        tasks = [
+            bridge.hue_activate_scene(
+                call, updated=skip_reload, hide_warnings=skip_reload
+            )
+            for bridge in hass.data[DOMAIN].values()
+            if isinstance(bridge, HueBridge)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Did *any* bridge succeed? If not, refresh / retry
+        # Note that we'll get a "None" value for a successful call
+        if None not in results:
+            if skip_reload:
+                await hue_activate_scene(call, skip_reload=False)
+                return
+            _LOGGER.warning(
+                "No bridge was able to activate " "scene %s in group %s",
+                scene_name,
+                group_name,
+            )
+
+    # Register a local handler for scene activation
+    hass.services.async_register(
+        DOMAIN, SERVICE_HUE_SCENE, hue_activate_scene, schema=SCENE_SCHEMA
+    )
 
     hass.data[DOMAIN] = {}
-    configured = configured_hosts(hass)
+    return True
 
-    # User has configured bridges
-    if CONF_BRIDGES in conf:
-        bridges = conf[CONF_BRIDGES]
 
-    # Component is part of config but no bridges specified, discover.
-    elif DOMAIN in config:
-        # discover from nupnp
-        websession = aiohttp_client.async_get_clientsession(hass)
+async def async_setup_entry(
+    hass: core.HomeAssistant, entry: config_entries.ConfigEntry
+):
+    """Set up a bridge from a config entry."""
 
-        async with websession.get(API_NUPNP) as req:
-            hosts = await req.json()
+    # Migrate allow_unreachable from config entry data to config entry options
+    if (
+        CONF_ALLOW_UNREACHABLE not in entry.options
+        and CONF_ALLOW_UNREACHABLE in entry.data
+        and entry.data[CONF_ALLOW_UNREACHABLE] != DEFAULT_ALLOW_UNREACHABLE
+    ):
+        options = {
+            **entry.options,
+            CONF_ALLOW_UNREACHABLE: entry.data[CONF_ALLOW_UNREACHABLE],
+        }
+        data = entry.data.copy()
+        data.pop(CONF_ALLOW_UNREACHABLE)
+        hass.config_entries.async_update_entry(entry, data=data, options=options)
 
-        bridges = []
-        for entry in hosts:
-            # Filter out already configured hosts
-            if entry['internalipaddress'] in configured:
-                continue
+    # Migrate allow_hue_groups from config entry data to config entry options
+    if (
+        CONF_ALLOW_HUE_GROUPS not in entry.options
+        and CONF_ALLOW_HUE_GROUPS in entry.data
+        and entry.data[CONF_ALLOW_HUE_GROUPS] != DEFAULT_ALLOW_HUE_GROUPS
+    ):
+        options = {
+            **entry.options,
+            CONF_ALLOW_HUE_GROUPS: entry.data[CONF_ALLOW_HUE_GROUPS],
+        }
+        data = entry.data.copy()
+        data.pop(CONF_ALLOW_HUE_GROUPS)
+        hass.config_entries.async_update_entry(entry, data=data, options=options)
 
-            # Run through config schema to populate defaults
-            bridges.append(BRIDGE_CONFIG_SCHEMA({
-                CONF_HOST: entry['internalipaddress'],
-                # Careful with using entry['id'] for other reasons. The
-                # value is in lowercase but is returned uppercase from hub.
-                CONF_FILENAME: '.hue_{}.conf'.format(entry['id']),
-            }))
-    else:
-        # Component not specified in config, we're loaded via discovery
-        bridges = []
+    bridge = HueBridge(hass, entry)
 
-    if not bridges:
-        return True
+    if not await bridge.async_setup():
+        return False
 
-    for bridge_conf in bridges:
-        host = bridge_conf[CONF_HOST]
+    hass.data[DOMAIN][entry.entry_id] = bridge
+    config = bridge.api.config
 
-        # Store config in hass.data so the config entry can find it
-        hass.data[DOMAIN][host] = bridge_conf
+    # For backwards compat
+    unique_id = normalize_bridge_id(config.bridgeid)
+    if entry.unique_id is None:
+        hass.config_entries.async_update_entry(entry, unique_id=unique_id)
 
-        # If configured, the bridge will be set up during config entry phase
-        if host in configured:
-            continue
+    # For recovering from bug where we incorrectly assumed homekit ID = bridge ID
+    elif entry.unique_id != unique_id:
+        # Find entries with this unique ID
+        other_entry = next(
+            (
+                entry
+                for entry in hass.config_entries.async_entries(DOMAIN)
+                if entry.unique_id == unique_id
+            ),
+            None,
+        )
 
-        # No existing config entry found, try importing it or trigger link
-        # config flow if no existing auth. Because we're inside the setup of
-        # this component we'll have to use hass.async_add_job to avoid a
-        # deadlock: creating a config entry will set up the component but the
-        # setup would block till the entry is created!
-        hass.async_add_job(hass.config_entries.flow.async_init(
-            DOMAIN, source='import', data={
-                'host': bridge_conf[CONF_HOST],
-                'path': bridge_conf[CONF_FILENAME],
-            }
-        ))
+        if other_entry is None:
+            # If no other entry, update unique ID of this entry ID.
+            hass.config_entries.async_update_entry(entry, unique_id=unique_id)
+
+        elif other_entry.source == config_entries.SOURCE_IGNORE:
+            # There is another entry but it is ignored, delete that one and update this one
+            hass.async_create_task(
+                hass.config_entries.async_remove(other_entry.entry_id)
+            )
+            hass.config_entries.async_update_entry(entry, unique_id=unique_id)
+        else:
+            # There is another entry that already has the right unique ID. Delete this entry
+            hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
+            return False
+
+    device_registry = await dr.async_get_registry(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, config.mac)},
+        identifiers={(DOMAIN, config.bridgeid)},
+        manufacturer="Signify",
+        name=config.name,
+        model=config.modelid,
+        sw_version=config.swversion,
+    )
+
+    if config.modelid == "BSB002" and config.swversion < "1935144040":
+        persistent_notification.async_create(
+            hass,
+            "Your Hue hub has a known security vulnerability ([CVE-2020-6007](https://cve.circl.lu/cve/CVE-2020-6007)). Go to the Hue app and check for software updates.",
+            "Signify Hue",
+            "hue_hub_firmware",
+        )
+
+    elif config.swupdate2_bridge_state == "readytoinstall":
+        err = (
+            "Please check for software updates of the bridge in the Philips Hue App.",
+            "Signify Hue",
+            "hue_hub_firmware",
+        )
+        _LOGGER.warning(err)
 
     return True
 
 
-async def async_setup_entry(hass, entry):
-    """Set up a bridge from a config entry."""
-    host = entry.data['host']
-    config = hass.data[DOMAIN].get(host)
-
-    if config is None:
-        allow_unreachable = DEFAULT_ALLOW_UNREACHABLE
-        allow_groups = DEFAULT_ALLOW_HUE_GROUPS
-    else:
-        allow_unreachable = config[CONF_ALLOW_UNREACHABLE]
-        allow_groups = config[CONF_ALLOW_HUE_GROUPS]
-
-    bridge = HueBridge(hass, entry, allow_unreachable, allow_groups)
-    hass.data[DOMAIN][host] = bridge
-    return await bridge.async_setup()
-
-
 async def async_unload_entry(hass, entry):
     """Unload a config entry."""
-    bridge = hass.data[DOMAIN].pop(entry.data['host'])
+    bridge = hass.data[DOMAIN].pop(entry.entry_id)
+    hass.services.async_remove(DOMAIN, SERVICE_HUE_SCENE)
     return await bridge.async_reset()

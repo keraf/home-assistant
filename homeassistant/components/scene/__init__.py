@@ -1,33 +1,28 @@
-"""
-Allow users to set and activate scenes.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/scene/
-"""
-import asyncio
+"""Allow users to set and activate scenes."""
+import functools as ft
 import importlib
 import logging
+from typing import Any, Optional
 
 import voluptuous as vol
 
-from homeassistant.const import (
-    ATTR_ENTITY_ID, CONF_PLATFORM, SERVICE_TURN_ON)
-from homeassistant.loader import bind_hass
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.light import ATTR_TRANSITION
+from homeassistant.const import CONF_PLATFORM, SERVICE_TURN_ON
+from homeassistant.core import DOMAIN as HA_DOMAIN
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.state import HASS_DOMAIN
 
-DOMAIN = 'scene'
-STATE = 'scening'
-STATES = 'states'
+# mypy: allow-untyped-defs, no-check-untyped-defs
+
+DOMAIN = "scene"
+STATE = "scening"
+STATES = "states"
 
 
 def _hass_domain_validator(config):
     """Validate platform in config for homeassistant domain."""
     if CONF_PLATFORM not in config:
-        config = {
-            CONF_PLATFORM: HASS_DOMAIN, STATES: config}
+        config = {CONF_PLATFORM: HA_DOMAIN, STATES: config}
 
     return config
 
@@ -36,12 +31,17 @@ def _platform_validator(config):
     """Validate it is a valid  platform."""
     try:
         platform = importlib.import_module(
-            'homeassistant.components.scene.{}'.format(
-                config[CONF_PLATFORM]))
+            ".{}".format(config[CONF_PLATFORM]), __name__
+        )
     except ImportError:
-        raise vol.Invalid('Invalid platform specified') from None
+        try:
+            platform = importlib.import_module(
+                "homeassistant.components.{}.scene".format(config[CONF_PLATFORM])
+            )
+        except ImportError:
+            raise vol.Invalid("Invalid platform specified") from None
 
-    if not hasattr(platform, 'PLATFORM_SCHEMA'):
+    if not hasattr(platform, "PLATFORM_SCHEMA"):
         return config
 
     return platform.PLATFORM_SCHEMA(config)
@@ -50,52 +50,33 @@ def _platform_validator(config):
 PLATFORM_SCHEMA = vol.Schema(
     vol.All(
         _hass_domain_validator,
-        vol.Schema({
-            vol.Required(CONF_PLATFORM): str
-        }, extra=vol.ALLOW_EXTRA),
-        _platform_validator
-    ), extra=vol.ALLOW_EXTRA)
-
-SCENE_SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
-
-
-@bind_hass
-def activate(hass, entity_id=None):
-    """Activate a scene."""
-    data = {}
-
-    if entity_id:
-        data[ATTR_ENTITY_ID] = entity_id
-
-    hass.services.call(DOMAIN, SERVICE_TURN_ON, data)
+        vol.Schema({vol.Required(CONF_PLATFORM): str}, extra=vol.ALLOW_EXTRA),
+        _platform_validator,
+    ),
+    extra=vol.ALLOW_EXTRA,
+)
 
 
 async def async_setup(hass, config):
     """Set up the scenes."""
-    logger = logging.getLogger(__name__)
-    component = hass.data[DOMAIN] = EntityComponent(logger, DOMAIN, hass)
+    component = hass.data[DOMAIN] = EntityComponent(
+        logging.getLogger(__name__), DOMAIN, hass
+    )
 
     await component.async_setup(config)
-
-    async def async_handle_scene_service(service):
-        """Handle calls to the switch services."""
-        target_scenes = component.async_extract_from_service(service)
-
-        tasks = [scene.async_activate() for scene in target_scenes]
-        if tasks:
-            await asyncio.wait(tasks, loop=hass.loop)
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_TURN_ON, async_handle_scene_service,
-        schema=SCENE_SERVICE_SCHEMA)
+    # Ensure Home Assistant platform always loaded.
+    await component.async_setup_platform(HA_DOMAIN, {"platform": HA_DOMAIN, STATES: []})
+    component.async_register_entity_service(
+        SERVICE_TURN_ON,
+        {ATTR_TRANSITION: vol.All(vol.Coerce(float), vol.Clamp(min=0, max=6553))},
+        "async_activate",
+    )
 
     return True
 
 
 async def async_setup_entry(hass, entry):
-    """Setup a config entry."""
+    """Set up a config entry."""
     return await hass.data[DOMAIN].async_setup_entry(entry)
 
 
@@ -108,22 +89,22 @@ class Scene(Entity):
     """A scene is a group of entities and the states we want them to be."""
 
     @property
-    def should_poll(self):
+    def should_poll(self) -> bool:
         """No polling needed."""
         return False
 
     @property
-    def state(self):
+    def state(self) -> Optional[str]:
         """Return the state of the scene."""
         return STATE
 
-    def activate(self):
+    def activate(self, **kwargs: Any) -> None:
         """Activate scene. Try to get entities into requested state."""
         raise NotImplementedError()
 
-    def async_activate(self):
-        """Activate scene. Try to get entities into requested state.
-
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(self.activate)
+    async def async_activate(self, **kwargs: Any) -> None:
+        """Activate scene. Try to get entities into requested state."""
+        assert self.hass
+        task = self.hass.async_add_job(ft.partial(self.activate, **kwargs))
+        if task:
+            await task

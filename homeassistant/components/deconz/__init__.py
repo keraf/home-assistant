@@ -1,67 +1,21 @@
-"""
-Support for deCONZ devices.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/deconz/
-"""
+"""Support for deCONZ devices."""
 import voluptuous as vol
 
-from homeassistant.const import (
-    CONF_API_KEY, CONF_EVENT, CONF_HOST,
-    CONF_ID, CONF_PORT, EVENT_HOMEASSISTANT_STOP)
-from homeassistant.core import EventOrigin, callback
-from homeassistant.helpers import aiohttp_client, config_validation as cv
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect, async_dispatcher_send)
-from homeassistant.util import slugify
-from homeassistant.util.json import load_json
+from homeassistant.config_entries import _UNDEF
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
-# Loading the config flow file will register the flow
-from .config_flow import configured_hosts
-from .const import (
-    CONF_ALLOW_CLIP_SENSOR, CONFIG_FILE, DATA_DECONZ_EVENT,
-    DATA_DECONZ_ID, DATA_DECONZ_UNSUB, DOMAIN, _LOGGER)
+from .config_flow import get_master_gateway
+from .const import CONF_BRIDGE_ID, CONF_GROUP_ID_BASE, CONF_MASTER_GATEWAY, DOMAIN
+from .gateway import DeconzGateway
+from .services import async_setup_services, async_unload_services
 
-REQUIREMENTS = ['pydeconz==38']
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Optional(CONF_API_KEY): cv.string,
-        vol.Optional(CONF_HOST): cv.string,
-        vol.Optional(CONF_PORT, default=80): cv.port,
-    })
-}, extra=vol.ALLOW_EXTRA)
-
-SERVICE_DECONZ = 'configure'
-
-SERVICE_FIELD = 'field'
-SERVICE_ENTITY = 'entity'
-SERVICE_DATA = 'data'
-
-SERVICE_SCHEMA = vol.Schema({
-    vol.Exclusive(SERVICE_FIELD, 'deconz_id'): cv.string,
-    vol.Exclusive(SERVICE_ENTITY, 'deconz_id'): cv.entity_id,
-    vol.Required(SERVICE_DATA): dict,
-})
+CONFIG_SCHEMA = vol.Schema(
+    {DOMAIN: vol.Schema({}, extra=vol.ALLOW_EXTRA)}, extra=vol.ALLOW_EXTRA
+)
 
 
 async def async_setup(hass, config):
-    """Load configuration for deCONZ component.
-
-    Discovery has loaded the component if DOMAIN is not present in config.
-    """
-    if DOMAIN in config:
-        deconz_config = None
-        config_file = await hass.async_add_job(
-            load_json, hass.config.path(CONFIG_FILE))
-        if config_file:
-            deconz_config = config_file
-        elif CONF_HOST in config[DOMAIN]:
-            deconz_config = config[DOMAIN]
-        if deconz_config and not configured_hosts(hass):
-            hass.async_add_job(hass.config_entries.flow.async_init(
-                DOMAIN, source='import', data=deconz_config
-            ))
+    """Old way of setting up deCONZ integrations."""
     return True
 
 
@@ -71,131 +25,62 @@ async def async_setup_entry(hass, config_entry):
     Load config, group, light and sensor data for server information.
     Start websocket for push notification of state changes from deCONZ.
     """
-    from pydeconz import DeconzSession
-    if DOMAIN in hass.data:
-        _LOGGER.error(
-            "Config entry failed since one deCONZ instance already exists")
+    if DOMAIN not in hass.data:
+        hass.data[DOMAIN] = {}
+
+    if not config_entry.options:
+        await async_update_master_gateway(hass, config_entry)
+
+    gateway = DeconzGateway(hass, config_entry)
+
+    if not await gateway.async_setup():
         return False
 
-    @callback
-    def async_add_device_callback(device_type, device):
-        """Called when a new device has been created in deCONZ."""
-        async_dispatcher_send(
-            hass, 'deconz_new_{}'.format(device_type), [device])
+    # 0.104 introduced config entry unique id, this makes upgrading possible
+    if config_entry.unique_id is None:
 
-    session = aiohttp_client.async_get_clientsession(hass)
-    deconz = DeconzSession(hass.loop, session, **config_entry.data,
-                           async_add_device=async_add_device_callback)
-    result = await deconz.async_load_parameters()
-    if result is False:
-        _LOGGER.error("Failed to communicate with deCONZ")
-        return False
+        new_data = _UNDEF
+        if CONF_BRIDGE_ID in config_entry.data:
+            new_data = dict(config_entry.data)
+            new_data[CONF_GROUP_ID_BASE] = config_entry.data[CONF_BRIDGE_ID]
 
-    hass.data[DOMAIN] = deconz
-    hass.data[DATA_DECONZ_ID] = {}
-    hass.data[DATA_DECONZ_EVENT] = []
-    hass.data[DATA_DECONZ_UNSUB] = []
+        hass.config_entries.async_update_entry(
+            config_entry, unique_id=gateway.api.config.bridgeid, data=new_data
+        )
 
-    for component in ['binary_sensor', 'light', 'scene', 'sensor']:
-        hass.async_add_job(hass.config_entries.async_forward_entry_setup(
-            config_entry, component))
+    hass.data[DOMAIN][config_entry.unique_id] = gateway
 
-    @callback
-    def async_add_remote(sensors):
-        """Setup remote from deCONZ."""
-        from pydeconz.sensor import SWITCH as DECONZ_REMOTE
-        allow_clip_sensor = config_entry.data.get(CONF_ALLOW_CLIP_SENSOR, True)
-        for sensor in sensors:
-            if sensor.type in DECONZ_REMOTE and \
-               not (not allow_clip_sensor and sensor.type.startswith('CLIP')):
-                hass.data[DATA_DECONZ_EVENT].append(DeconzEvent(hass, sensor))
-    hass.data[DATA_DECONZ_UNSUB].append(
-        async_dispatcher_connect(hass, 'deconz_new_sensor', async_add_remote))
+    await gateway.async_update_device_registry()
 
-    async_add_remote(deconz.sensors.values())
+    await async_setup_services(hass)
 
-    deconz.start()
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, gateway.shutdown)
 
-    async def async_configure(call):
-        """Set attribute of device in deCONZ.
-
-        Field is a string representing a specific device in deCONZ
-        e.g. field='/lights/1/state'.
-        Entity_id can be used to retrieve the proper field.
-        Data is a json object with what data you want to alter
-        e.g. data={'on': true}.
-        {
-            "field": "/lights/1/state",
-            "data": {"on": true}
-        }
-        See Dresden Elektroniks REST API documentation for details:
-        http://dresden-elektronik.github.io/deconz-rest-doc/rest/
-        """
-        field = call.data.get(SERVICE_FIELD)
-        entity_id = call.data.get(SERVICE_ENTITY)
-        data = call.data.get(SERVICE_DATA)
-        deconz = hass.data[DOMAIN]
-        if entity_id:
-            entities = hass.data.get(DATA_DECONZ_ID)
-            if entities:
-                field = entities.get(entity_id)
-            if field is None:
-                _LOGGER.error('Could not find the entity %s', entity_id)
-                return
-        await deconz.async_put_state(field, data)
-    hass.services.async_register(
-        DOMAIN, SERVICE_DECONZ, async_configure, schema=SERVICE_SCHEMA)
-
-    @callback
-    def deconz_shutdown(event):
-        """
-        Wrap the call to deconz.close.
-
-        Used as an argument to EventBus.async_listen_once - EventBus calls
-        this method with the event as the first argument, which should not
-        be passed on to deconz.close.
-        """
-        deconz.close()
-
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, deconz_shutdown)
     return True
 
 
 async def async_unload_entry(hass, config_entry):
     """Unload deCONZ config entry."""
-    deconz = hass.data.pop(DOMAIN)
-    hass.services.async_remove(DOMAIN, SERVICE_DECONZ)
-    deconz.close()
-    for component in ['binary_sensor', 'light', 'scene', 'sensor']:
-        await hass.config_entries.async_forward_entry_unload(
-            config_entry, component)
-    dispatchers = hass.data[DATA_DECONZ_UNSUB]
-    for unsub_dispatcher in dispatchers:
-        unsub_dispatcher()
-    hass.data[DATA_DECONZ_UNSUB] = []
-    hass.data[DATA_DECONZ_EVENT] = []
-    hass.data[DATA_DECONZ_ID] = []
-    return True
+    gateway = hass.data[DOMAIN].pop(config_entry.unique_id)
+
+    if not hass.data[DOMAIN]:
+        await async_unload_services(hass)
+
+    elif gateway.master:
+        await async_update_master_gateway(hass, config_entry)
+        new_master_gateway = next(iter(hass.data[DOMAIN].values()))
+        await async_update_master_gateway(hass, new_master_gateway.config_entry)
+
+    return await gateway.async_reset()
 
 
-class DeconzEvent(object):
-    """When you want signals instead of entities.
+async def async_update_master_gateway(hass, config_entry):
+    """Update master gateway boolean.
 
-    Stateless sensors such as remotes are expected to generate an event
-    instead of a sensor entity in hass.
+    Called by setup_entry and unload_entry.
+    Makes sure there is always one master available.
     """
+    master = not get_master_gateway(hass)
+    options = {**config_entry.options, CONF_MASTER_GATEWAY: master}
 
-    def __init__(self, hass, device):
-        """Register callback that will be used for signals."""
-        self._hass = hass
-        self._device = device
-        self._device.register_async_callback(self.async_update_callback)
-        self._event = 'deconz_{}'.format(CONF_EVENT)
-        self._id = slugify(self._device.name)
-
-    @callback
-    def async_update_callback(self, reason):
-        """Fire the event if reason is that state is updated."""
-        if reason['state']:
-            data = {CONF_ID: self._id, CONF_EVENT: self._device.state}
-            self._hass.bus.async_fire(self._event, data, EventOrigin.remote)
+    hass.config_entries.async_update_entry(config_entry, options=options)

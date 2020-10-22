@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Location",
+        "description": "Instituto Portugu\u00eas do Mar e Atmosfera",
+        "data": {
+          "name": "[%key:common::config_flow::data::name%]",
+          "latitude": "[%key:common::config_flow::data::latitude%]",
+          "longitude": "[%key:common::config_flow::data::longitude%]",
+          "mode": "Mode"
+        }
+      }
+    },
+    "error": { "name_exists": "Name already exists" }
+  }
+}

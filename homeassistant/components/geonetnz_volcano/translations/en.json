@@ -1,0 +1,18 @@
+{
+    "config": {
+        "abort": {
+            "already_configured": "Location is already configured"
+        },
+        "error": {
+            "identifier_exists": "Location already registered"
+        },
+        "step": {
+            "user": {
+                "data": {
+                    "radius": "Radius"
+                },
+                "title": "Fill in your filter details."
+            }
+        }
+    }
+}

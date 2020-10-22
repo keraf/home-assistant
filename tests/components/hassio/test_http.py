@@ -1,133 +1,183 @@
 """The tests for the hassio component."""
 import asyncio
-from unittest.mock import patch, Mock, MagicMock
 
 import pytest
 
-from homeassistant.const import HTTP_HEADER_HA_AUTH
+from homeassistant.components.hassio.http import _need_auth
 
-from tests.common import mock_coro
-from . import API_PASSWORD
+from tests.async_mock import patch
 
 
-@asyncio.coroutine
-def test_forward_request(hassio_client):
+async def test_forward_request(hassio_client, aioclient_mock):
     """Test fetching normal path."""
-    response = MagicMock()
-    response.read.return_value = mock_coro('data')
+    aioclient_mock.post("http://127.0.0.1/beer", text="response")
 
-    with patch('homeassistant.components.hassio.HassIOView._command_proxy',
-               Mock(return_value=mock_coro(response))), \
-            patch('homeassistant.components.hassio.http'
-                  '._create_response') as mresp:
-        mresp.return_value = 'response'
-        resp = yield from hassio_client.post('/api/hassio/beer', headers={
-                HTTP_HEADER_HA_AUTH: API_PASSWORD
-            })
+    resp = await hassio_client.post("/api/hassio/beer")
 
     # Check we got right response
     assert resp.status == 200
-    body = yield from resp.text()
-    assert body == 'response'
+    body = await resp.text()
+    assert body == "response"
 
     # Check we forwarded command
-    assert len(mresp.mock_calls) == 1
-    assert mresp.mock_calls[0][1] == (response, 'data')
+    assert len(aioclient_mock.mock_calls) == 1
 
 
-@asyncio.coroutine
-def test_auth_required_forward_request(hassio_client):
+@pytest.mark.parametrize(
+    "build_type", ["supervisor/info", "homeassistant/update", "host/info"]
+)
+async def test_auth_required_forward_request(hassio_noauth_client, build_type):
     """Test auth required for normal request."""
-    resp = yield from hassio_client.post('/api/hassio/beer')
+    resp = await hassio_noauth_client.post(f"/api/hassio/{build_type}")
 
     # Check we got right response
     assert resp.status == 401
 
 
-@asyncio.coroutine
 @pytest.mark.parametrize(
-    'build_type', [
-        'es5/index.html', 'es5/hassio-app.html', 'latest/index.html',
-        'latest/hassio-app.html', 'es5/some-chunk.js', 'es5/app.js',
-    ])
-def test_forward_request_no_auth_for_panel(hassio_client, build_type):
+    "build_type",
+    [
+        "app/index.html",
+        "app/hassio-app.html",
+        "app/index.html",
+        "app/hassio-app.html",
+        "app/some-chunk.js",
+        "app/app.js",
+    ],
+)
+async def test_forward_request_no_auth_for_panel(
+    hassio_client, build_type, aioclient_mock
+):
     """Test no auth needed for ."""
-    response = MagicMock()
-    response.read.return_value = mock_coro('data')
+    aioclient_mock.get(f"http://127.0.0.1/{build_type}", text="response")
 
-    with patch('homeassistant.components.hassio.HassIOView._command_proxy',
-               Mock(return_value=mock_coro(response))), \
-            patch('homeassistant.components.hassio.http.'
-                  '_create_response') as mresp:
-        mresp.return_value = 'response'
-        resp = yield from hassio_client.get(
-            '/api/hassio/app-{}'.format(build_type))
+    resp = await hassio_client.get(f"/api/hassio/{build_type}")
 
     # Check we got right response
     assert resp.status == 200
-    body = yield from resp.text()
-    assert body == 'response'
+    body = await resp.text()
+    assert body == "response"
 
     # Check we forwarded command
-    assert len(mresp.mock_calls) == 1
-    assert mresp.mock_calls[0][1] == (response, 'data')
+    assert len(aioclient_mock.mock_calls) == 1
 
 
-@asyncio.coroutine
-def test_forward_request_no_auth_for_logo(hassio_client):
-    """Test no auth needed for ."""
-    response = MagicMock()
-    response.read.return_value = mock_coro('data')
+async def test_forward_request_no_auth_for_logo(hassio_client, aioclient_mock):
+    """Test no auth needed for logo."""
+    aioclient_mock.get("http://127.0.0.1/addons/bl_b392/logo", text="response")
 
-    with patch('homeassistant.components.hassio.HassIOView._command_proxy',
-               Mock(return_value=mock_coro(response))), \
-            patch('homeassistant.components.hassio.http.'
-                  '_create_response') as mresp:
-        mresp.return_value = 'response'
-        resp = yield from hassio_client.get('/api/hassio/addons/bl_b392/logo')
+    resp = await hassio_client.get("/api/hassio/addons/bl_b392/logo")
 
     # Check we got right response
     assert resp.status == 200
-    body = yield from resp.text()
-    assert body == 'response'
+    body = await resp.text()
+    assert body == "response"
 
     # Check we forwarded command
-    assert len(mresp.mock_calls) == 1
-    assert mresp.mock_calls[0][1] == (response, 'data')
+    assert len(aioclient_mock.mock_calls) == 1
 
 
-@asyncio.coroutine
-def test_forward_log_request(hassio_client):
-    """Test fetching normal log path."""
-    response = MagicMock()
-    response.read.return_value = mock_coro('data')
+async def test_forward_request_no_auth_for_icon(hassio_client, aioclient_mock):
+    """Test no auth needed for icon."""
+    aioclient_mock.get("http://127.0.0.1/addons/bl_b392/icon", text="response")
 
-    with patch('homeassistant.components.hassio.HassIOView._command_proxy',
-               Mock(return_value=mock_coro(response))), \
-            patch('homeassistant.components.hassio.http.'
-                  '_create_response_log') as mresp:
-        mresp.return_value = 'response'
-        resp = yield from hassio_client.get('/api/hassio/beer/logs', headers={
-                HTTP_HEADER_HA_AUTH: API_PASSWORD
-            })
+    resp = await hassio_client.get("/api/hassio/addons/bl_b392/icon")
 
     # Check we got right response
     assert resp.status == 200
-    body = yield from resp.text()
-    assert body == 'response'
+    body = await resp.text()
+    assert body == "response"
 
     # Check we forwarded command
-    assert len(mresp.mock_calls) == 1
-    assert mresp.mock_calls[0][1] == (response, 'data')
+    assert len(aioclient_mock.mock_calls) == 1
 
 
-@asyncio.coroutine
-def test_bad_gateway_when_cannot_find_supervisor(hassio_client):
+async def test_forward_log_request(hassio_client, aioclient_mock):
+    """Test fetching normal log path doesn't remove ANSI color escape codes."""
+    aioclient_mock.get("http://127.0.0.1/beer/logs", text="\033[32mresponse\033[0m")
+
+    resp = await hassio_client.get("/api/hassio/beer/logs")
+
+    # Check we got right response
+    assert resp.status == 200
+    body = await resp.text()
+    assert body == "\033[32mresponse\033[0m"
+
+    # Check we forwarded command
+    assert len(aioclient_mock.mock_calls) == 1
+
+
+async def test_bad_gateway_when_cannot_find_supervisor(hassio_client):
     """Test we get a bad gateway error if we can't find supervisor."""
-    with patch('homeassistant.components.hassio.http.async_timeout.timeout',
-               side_effect=asyncio.TimeoutError):
-        resp = yield from hassio_client.get(
-            '/api/hassio/addons/test/info', headers={
-                HTTP_HEADER_HA_AUTH: API_PASSWORD
-            })
+    with patch(
+        "homeassistant.components.hassio.http.async_timeout.timeout",
+        side_effect=asyncio.TimeoutError,
+    ):
+        resp = await hassio_client.get("/api/hassio/addons/test/info")
     assert resp.status == 502
+
+
+async def test_forwarding_user_info(hassio_client, hass_admin_user, aioclient_mock):
+    """Test that we forward user info correctly."""
+    aioclient_mock.get("http://127.0.0.1/hello")
+
+    resp = await hassio_client.get("/api/hassio/hello")
+
+    # Check we got right response
+    assert resp.status == 200
+
+    assert len(aioclient_mock.mock_calls) == 1
+
+    req_headers = aioclient_mock.mock_calls[0][-1]
+    req_headers["X-Hass-User-ID"] == hass_admin_user.id
+    req_headers["X-Hass-Is-Admin"] == "1"
+
+
+async def test_snapshot_upload_headers(hassio_client, aioclient_mock):
+    """Test that we forward the full header for snapshot upload."""
+    content_type = "multipart/form-data; boundary='--webkit'"
+    aioclient_mock.get("http://127.0.0.1/snapshots/new/upload")
+
+    resp = await hassio_client.get(
+        "/api/hassio/snapshots/new/upload", headers={"Content-Type": content_type}
+    )
+
+    # Check we got right response
+    assert resp.status == 200
+
+    assert len(aioclient_mock.mock_calls) == 1
+
+    req_headers = aioclient_mock.mock_calls[0][-1]
+    req_headers["Content-Type"] == content_type
+
+
+async def test_snapshot_download_headers(hassio_client, aioclient_mock):
+    """Test that we forward the full header for snapshot download."""
+    content_disposition = "attachment; filename=test.tar"
+    aioclient_mock.get(
+        "http://127.0.0.1/snapshots/slug/download",
+        headers={
+            "Content-Length": "50000000",
+            "Content-Disposition": content_disposition,
+        },
+    )
+
+    resp = await hassio_client.get("/api/hassio/snapshots/slug/download")
+
+    # Check we got right response
+    assert resp.status == 200
+
+    assert len(aioclient_mock.mock_calls) == 1
+
+    resp.headers["Content-Disposition"] == content_disposition
+
+
+def test_need_auth(hass):
+    """Test if the requested path needs authentication."""
+    assert not _need_auth(hass, "addons/test/logo")
+    assert _need_auth(hass, "snapshots/new/upload")
+    assert _need_auth(hass, "supervisor/logs")
+
+    hass.data["onboarding"] = False
+    assert not _need_auth(hass, "snapshots/new/upload")
+    assert not _need_auth(hass, "supervisor/logs")
